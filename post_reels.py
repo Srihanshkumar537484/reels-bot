@@ -1,34 +1,41 @@
 """
-Har run par queue/ se agle REELS_PER_RUN reels uthata hai aur
-ACCOUNTS_JSON ke sabhi accounts par same caption ke sath upload karta hai.
-Progress state.json me save hota hai (jo account fail hua, agle run me retry hoga).
+Instagram Reels auto poster.
+
+Har run me queue/ ke sabse naye REELS_PER_RUN folders (jaise 001, 002) uthata hai
+aur WINDOW_START-WINDOW_END (IST) ke beech sabhi accounts par same caption ke sath
+post karta hai. Reel 1 pehle sab accounts par, phir reel 2 sab accounts par.
+Nayi reels (003, 004...) daalte hi wo apne aap purani ki jagah le leti hain.
 """
 import json
 import os
+import random
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
 
 API = "https://graph.facebook.com/v21.0"
+IST = timezone(timedelta(hours=5, minutes=30))
 ROOT = Path(__file__).parent
 QUEUE = ROOT / "queue"
-STATE_FILE = ROOT / "state.json"
-REELS_PER_RUN = int(os.getenv("REELS_PER_RUN", "2"))
 VIDEO_EXT = (".mp4", ".mov")
 
-
-def load_state():
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {}
+REELS_PER_RUN = int(os.getenv("REELS_PER_RUN", "2"))
+WINDOW_START = os.getenv("WINDOW_START", "").strip()  # IST, jaise "09:00"
+WINDOW_END = os.getenv("WINDOW_END", "").strip()      # IST, jaise "10:00"
 
 
-def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+def now():
+    return datetime.now(IST)
+
+
+def sleep_until(target):
+    secs = (target - now()).total_seconds()
+    if secs > 0:
+        time.sleep(secs)
 
 
 def api(method, path, token, **kwargs):
@@ -113,6 +120,34 @@ def load_accounts():
     return accounts
 
 
+def latest_reels():
+    """Sabse naye REELS_PER_RUN folders (video + caption.txt dono wale), purane-se-naya order me."""
+    if not QUEUE.exists():
+        return []
+    ok = [
+        p for p in sorted(QUEUE.iterdir())
+        if p.is_dir() and find_video(p) and (p / "caption.txt").exists()
+    ]
+    return ok[-REELS_PER_RUN:]
+
+
+def at_today(hhmm):
+    h, m = hhmm.split(":")
+    return now().replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+
+
+def try_post(acc, video_url, caption):
+    try:
+        return post_reel(acc, video_url, caption), None
+    except Exception as e:
+        print(f"       retry 1 baar ({e})")
+        time.sleep(60)
+        try:
+            return post_reel(acc, video_url, caption), None
+        except Exception as e2:
+            return None, e2
+
+
 def main():
     accounts = load_accounts()
     print(f"{len(accounts)} accounts mile:")
@@ -122,53 +157,57 @@ def main():
         return
     if not accounts:
         sys.exit("Koi account nahi mila. Token/permissions check karo.")
-    names = [a["name"] for a in accounts]
+
+    reels = latest_reels()
+    if not reels:
+        print("Queue me koi reel (video + caption.txt) nahi mili.")
+        return
+    print("Is run ki reels:", ", ".join(r.name for r in reels))
+
     repo = os.environ["GITHUB_REPOSITORY"]
     branch = os.getenv("GITHUB_REF_NAME", "main")
 
-    state = load_state()
-    folders = sorted(p for p in QUEUE.iterdir() if p.is_dir()) if QUEUE.exists() else []
+    # Task list: reel 1 sab accounts par, phir reel 2 sab accounts par
+    tasks = [(r, a) for r in reels for a in accounts]
 
-    pending = []
-    for folder in folders:
-        done = state.get(folder.name, [])
-        if all(n in done for n in names):
-            continue
-        if find_video(folder) and (folder / "caption.txt").exists():
-            pending.append(folder)
-        if len(pending) == REELS_PER_RUN:
-            break
-
-    if not pending:
-        print("Queue khaali hai - koi nayi reel nahi mili.")
-        return
+    scheduled = bool(WINDOW_START and WINDOW_END)
+    if scheduled:
+        start = at_today(WINDOW_START)
+        end = at_today(WINDOW_END)
+        if now() < start:
+            print(f"Window {WINDOW_START} IST ka wait: {start:%H:%M} tak ruk rahe hain...")
+            sleep_until(start)
+        begin = now()
+        end = max(end, begin + timedelta(minutes=15))  # cron late ho to bhi kam se kam 15 min
+        usable = (end - begin).total_seconds() - 180   # last post ke processing ka buffer
+        slot = max(20.0, usable / len(tasks))
+        print(f"Posting {begin:%H:%M} se {end:%H:%M} IST ke beech, har post ~{slot/60:.1f} min ke gap par")
+    else:
+        begin, slot = now(), 0  # manual test: jaldi jaldi
 
     failures = 0
-    for folder in pending:
+    for i, (folder, acc) in enumerate(tasks):
+        if scheduled:
+            sleep_until(begin + timedelta(seconds=i * slot + random.uniform(0, 0.5 * slot)))
+        elif i:
+            time.sleep(random.uniform(5, 20))
+
         video = find_video(folder)
         caption = (folder / "caption.txt").read_text(encoding="utf-8").strip()
         video_url = (
             f"https://raw.githubusercontent.com/{repo}/{branch}/queue/"
             f"{quote(folder.name)}/{quote(video.name)}"
         )
-        print(f"\n=== Reel {folder.name} ===\n{video_url}")
-
-        done = state.setdefault(folder.name, [])
-        for acc in accounts:
-            if acc["name"] in done:
-                continue
-            try:
-                media_id = post_reel(acc, video_url, caption)
-                done.append(acc["name"])
-                save_state(state)
-                print(f"[OK]   {acc['name']} -> {media_id}")
-            except Exception as e:
-                failures += 1
-                print(f"[FAIL] {acc['name']}: {e}")
-            time.sleep(5)
+        media_id, err = try_post(acc, video_url, caption)
+        t = now().strftime("%H:%M")
+        if err:
+            failures += 1
+            print(f"[FAIL] {t} reel {folder.name} -> {acc['name']}: {err}")
+        else:
+            print(f"[OK]   {t} reel {folder.name} -> {acc['name']} ({media_id})")
 
     if failures:
-        print(f"\n{failures} upload fail hue (agle run me retry honge).")
+        print(f"\n{failures} post fail hue.")
         sys.exit(1)
 
 
